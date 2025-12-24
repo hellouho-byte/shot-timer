@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Shot Timer (iPhone)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding: 18px; max-width: 760px; margin: 0 auto; }
+    .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+    button { font-size: 18px; padding: 10px 16px; }
+    .timer { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 44px; margin: 10px 0; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 14px; margin-top: 12px; }
+    label { display:block; margin-top: 10px; }
+    input[type="range"] { width: 100%; }
+    progress { width: 100%; height: 16px; }
+    pre { white-space: pre-wrap; background: #fafafa; padding: 12px; border-radius: 10px; border: 1px solid #eee; }
+    .muted { color:#666; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h2>Shot Timer (iPhone 안정화)</h2>
+
+  <div class="row">
+    <button id="startBtn">START</button>
+    <button id="resetBtn">RESET</button>
+    <span id="status">대기 중</span>
+  </div>
+
+  <div class="timer" id="timer">0.000 s</div>
+
+  <div class="card">
+    <label>
+      수음 민감도(Threshold): <b id="thrText">0.20</b>
+      <input id="thr" type="range" min="0.05" max="0.90" step="0.01" value="0.20" />
+      <div class="muted">값을 올리면 둔감, 내리면 민감</div>
+    </label>
+
+    <label>
+      몇 번째 총소리에 정지?: <b id="targetText">1</b>
+      <input id="target" type="range" min="1" max="10" step="1" value="1" />
+    </label>
+
+    <label>
+      재감지 방지(ms): <b id="refText">220</b>
+      <input id="ref" type="range" min="80" max="600" step="10" value="220" />
+      <div class="muted">한 발이 두 번 잡히면 이 값을 올려</div>
+    </label>
+
+    <label class="muted">
+      현재 입력 레벨(혼합 스코어):
+      <progress id="level" max="1" value="0"></progress>
+    </label>
+
+    <div class="row" style="margin-top:10px;">
+      <span id="count">감지: 0 / 목표: 1</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="muted">로그</div>
+    <pre id="log">START 터치 → (3~6초 후 삐) → 목표 횟수의 격발음 감지 시 정지</pre>
+  </div>
+
+<script>
+(() => {
+  const startBtn = document.getElementById('startBtn');
+  const resetBtn = document.getElementById('resetBtn');
+  const statusEl = document.getElementById('status');
+  const timerEl = document.getElementById('timer');
+  const thr = document.getElementById('thr');
+  const thrText = document.getElementById('thrText');
+  const target = document.getElementById('target');
+  const targetText = document.getElementById('targetText');
+  const ref = document.getElementById('ref');
+  const refText = document.getElementById('refText');
+  const level = document.getElementById('level');
+  const countEl = document.getElementById('count');
+  const logEl = document.getElementById('log');
+
+  function log(msg){ logEl.textContent += "\n" + msg; logEl.scrollTop = logEl.scrollHeight; }
+
+  // State
+  let audioCtx = null, analyser = null, micStream = null;
+  let data = null;
+
+  let armed = false, running = false;
+  let startTime = 0;
+  let rafId = null;
+
+  let shotCount = 0;
+  let lastTriggerMs = 0;
+
+  // UI bindings
+  thr.addEventListener('input', () => thrText.textContent = Number(thr.value).toFixed(2));
+  target.addEventListener('input', () => {
+    targetText.textContent = target.value;
+    countEl.textContent = `감지: ${shotCount} / 목표: ${target.value}`;
+  });
+  ref.addEventListener('input', () => refText.textContent = ref.value);
+
+  async function ensureMic(){
+    if (audioCtx && analyser && micStream) {
+      await audioCtx.resume();
+      return;
+    }
+
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    await audioCtx.resume();
+
+    // iOS는 옵션을 무시할 수도 있지만 일단 요청
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false
+      }
+    });
+
+    const src = audioCtx.createMediaStreamSource(micStream);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 2048;
+    analyser.smoothingTimeConstant = 0.05;
+    src.connect(analyser);
+
+    data = new Float32Array(analyser.fftSize);
+  }
+
+  function beep(){
+    const ctx = audioCtx;
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.type = 'sine';
+    o.frequency.value = 1000;
+    g.gain.setValueAtTime(0.0001, ctx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.25, ctx.currentTime + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.22);
+    o.connect(g).connect(ctx.destination);
+    o.start();
+    o.stop(ctx.currentTime + 0.24);
+  }
+
+  function resetAll(hard=false){
+    armed = false; running = false;
+    startTime = 0;
+    shotCount = 0;
+    lastTriggerMs = 0;
+
+    statusEl.textContent = "대기 중";
+    timerEl.textContent = "0.000 s";
+    level.value = 0;
+    countEl.textContent = `감지: 0 / 목표: ${target.value}`;
+    startBtn.disabled = false;
+
+    if (hard) logEl.textContent = "START 터치 → (3~6초 후 삐) → 목표 횟수의 격발음 감지 시 정지";
+    else log("[RESET]");
+  }
+
+  function stopTimer(nowSec){
+    running = false; armed = false;
+    startBtn.disabled = false;
+    const elapsed = nowSec - startTime;
+    statusEl.textContent = "정지됨";
+    log(`[STOP] 총 소요 시간: ${elapsed.toFixed(4)} s`);
+  }
+
+  // iOS 안정화: peak + RMS 혼합 스코어
+  function computeScore(buf){
+    let peak = 0;
+    let sumSq = 0;
+    for (let i=0;i<buf.length;i++){
+      const v = buf[i];
+      const a = Math.abs(v);
+      if (a > peak) peak = a;
+      sumSq += v*v;
+    }
+    const rms = Math.sqrt(sumSq / buf.length);
+    // 경험적으로: rms는 피크보다 작아서 보정 계수 곱
+    const score = Math.max(peak, rms * 2.2);
+    return {score, peak, rms};
+  }
+
+  function loop(){
+    if (!analyser) return;
+
+    analyser.getFloatTimeDomainData(data);
+    const {score, peak, rms} = computeScore(data);
+    level.value = Math.min(1, Math.max(0, score));
+
+    const now = audioCtx.currentTime;
+    if (running) timerEl.textContent = `${(now - startTime).toFixed(3)} s`;
+
+    if (armed && running){
+      const threshold = Number(thr.value);
+      const nowMs = performance.now();
+      const refractory = Number(ref.value);
+
+      if (score >= threshold && (nowMs - lastTriggerMs) >= refractory){
+        lastTriggerMs = nowMs;
+        shotCount += 1;
+        const t = now - startTime;
+        log(`[SHOT ${shotCount}] t=${t.toFixed(4)}s score=${score.toFixed(3)} peak=${peak.toFixed(3)} rms=${rms.toFixed(3)}`);
+        countEl.textContent = `감지: ${shotCount} / 목표: ${target.value}`;
+        if (shotCount >= Number(target.value)) stopTimer(now);
+      }
+    }
+
+    rafId = requestAnimationFrame(loop);
+  }
+
+  startBtn.addEventListener('click', async () => {
+    try{
+      startBtn.disabled = true;
+      await ensureMic();         // iOS에서 START 터치로 컨텍스트/마이크 활성화
+      await audioCtx.resume();
+
+      resetAll(false);
+      statusEl.textContent = "랜덤 딜레이 중... (3~6초)";
+      log("[INFO] 랜덤 딜레이 시작");
+
+      if (!rafId) loop();
+
+      const delayMs = 3000 + Math.random()*3000;
+      setTimeout(() => {
+        beep();
+        startTime = audioCtx.currentTime;
+        running = true;
+        armed = true;
+        shotCount = 0;
+        lastTriggerMs = 0;
+
+        statusEl.textContent = "타이머 시작! (격발음 감지 중)";
+        countEl.textContent = `감지: 0 / 목표: ${target.value}`;
+        log("[START] 삐! 타이머 시작");
+      }, delayMs);
+
+    } catch(e){
+      startBtn.disabled = false;
+      statusEl.textContent = "마이크 권한/장치 오류";
+      log(`[ERROR] ${e?.message || e}`);
+      alert("마이크 권한이 필요합니다. Safari에서 마이크 허용 후 다시 시도하세요.");
+    }
+  });
+
+  resetBtn.addEventListener('click', () => resetAll(true));
+
+})();
+</script>
+</body>
+</html>
